@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional, Union, cast
@@ -21,6 +22,7 @@ from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (IterationStats, LoRARequestStates,
                                    RequestStateStats)
+from vllm.v1.tps_profiling import tps_profile_log, tps_profiling_enabled
 
 
 class RequestOutputCollector:
@@ -405,6 +407,13 @@ class OutputProcessor:
         within the loop below.
         """
 
+        profile_enabled = tps_profiling_enabled()
+        process_start_ns = time.perf_counter_ns() if profile_enabled else 0
+        detokenize_ns = 0
+        logprobs_ns = 0
+        make_output_ns = 0
+        detokenize_reqs = 0
+
         request_outputs: Union[list[RequestOutput],
                                list[PoolingRequestOutput]] = []
         reqs_to_abort: list[str] = []
@@ -432,18 +441,30 @@ class OutputProcessor:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
+                detokenize_start_ns = time.perf_counter_ns(
+                ) if profile_enabled else 0
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP)
+                if profile_enabled:
+                    detokenize_ns += time.perf_counter_ns(
+                    ) - detokenize_start_ns
+                    detokenize_reqs += 1
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
+                logprobs_start_ns = time.perf_counter_ns(
+                ) if profile_enabled else 0
                 req_state.logprobs_processor.update_from_output(
                     engine_core_output)
+                if profile_enabled:
+                    logprobs_ns += time.perf_counter_ns() - logprobs_start_ns
 
             # 4) Create and handle RequestOutput objects.
+            make_output_start_ns = time.perf_counter_ns(
+            ) if profile_enabled else 0
             if request_output := req_state.make_request_output(
                     new_token_ids, pooling_output, finish_reason, stop_reason,
                     kv_transfer_params):
@@ -453,6 +474,8 @@ class OutputProcessor:
                 else:
                     # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
+            if profile_enabled:
+                make_output_ns += time.perf_counter_ns() - make_output_start_ns
 
             # Free completed requests.
             if finish_reason is not None:
@@ -473,6 +496,18 @@ class OutputProcessor:
                     self.do_tracing(engine_core_output, req_state,
                                     iteration_stats)
         self.lora_states.update_iteration_stats(iteration_stats)
+
+        if profile_enabled:
+            process_end_ns = time.perf_counter_ns()
+            tps_profile_log(
+                "frontend.process_outputs",
+                detokenize_reqs=detokenize_reqs,
+                detokenize_us=detokenize_ns / 1000,
+                logprobs_us=logprobs_ns / 1000,
+                make_output_us=make_output_ns / 1000,
+                num_outputs=len(engine_core_outputs),
+                total_us=(process_end_ns - process_start_ns) / 1000,
+            )
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,

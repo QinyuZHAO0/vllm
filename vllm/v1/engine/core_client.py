@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -36,6 +37,7 @@ from vllm.v1.engine.utils import (CoreEngineActorManager,
                                   CoreEngineProcManager, launch_core_engines)
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+from vllm.v1.tps_profiling import tps_profile_log, tps_profiling_enabled
 
 logger = init_logger(__name__)
 
@@ -616,6 +618,7 @@ class SyncMPClient(MPClient):
         decoder = self.decoder
         utility_results = self.utility_results
         outputs_queue = self.outputs_queue
+        profile_enabled = tps_profiling_enabled()
 
         shutdown_path = get_open_zmq_inproc_path()
         resources = self.resources
@@ -637,9 +640,24 @@ class SyncMPClient(MPClient):
                         # shutdown signal, exit thread.
                         break
 
+                    recv_start_ns = time.perf_counter_ns(
+                    ) if profile_enabled else 0
                     frames = out_socket.recv_multipart(copy=False)
+                    recv_end_ns = time.perf_counter_ns(
+                    ) if profile_enabled else 0
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    decode_end_ns = time.perf_counter_ns(
+                    ) if profile_enabled else 0
+                    if profile_enabled and not outputs.utility_output:
+                        tps_profile_log(
+                            "mp_client.output_decode",
+                            decode_us=(decode_end_ns - recv_end_ns) / 1000,
+                            num_frames=len(frames),
+                            num_outputs=len(outputs.outputs),
+                            recv_us=(recv_end_ns - recv_start_ns) / 1000,
+                            total_us=(decode_end_ns - recv_start_ns) / 1000,
+                        )
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output,
                                                 utility_results)

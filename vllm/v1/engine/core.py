@@ -50,6 +50,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.tps_profiling import tps_profile_log, tps_profiling_enabled
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -886,6 +887,7 @@ class EngineCoreProc(EngineCore):
 
         # Msgpack serialization encoding.
         encoder = MsgpackEncoder()
+        profile_enabled = tps_profiling_enabled()
         # Send buffers to reuse.
         reuse_buffers: list[bytearray] = []
         # Keep references to outputs and buffers until zmq is finished
@@ -929,10 +931,25 @@ class EngineCoreProc(EngineCore):
                     reuse_buffers.append(pending.pop()[2])
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                encode_start_ns = time.perf_counter_ns(
+                ) if profile_enabled else 0
                 buffers = encoder.encode_into(outputs, buffer)
+                encode_end_ns = time.perf_counter_ns(
+                ) if profile_enabled else 0
                 tracker = sockets[client_index].send_multipart(buffers,
                                                                copy=False,
                                                                track=True)
+                send_end_ns = time.perf_counter_ns(
+                ) if profile_enabled else 0
+                if profile_enabled:
+                    tps_profile_log(
+                        "engine_core.output_encode",
+                        encode_us=(encode_end_ns - encode_start_ns) / 1000,
+                        num_buffers=len(buffers),
+                        num_outputs=len(outputs.outputs),
+                        send_us=(send_end_ns - encode_end_ns) / 1000,
+                        total_us=(send_end_ns - encode_start_ns) / 1000,
+                    )
                 if not tracker.done:
                     ref = outputs if len(buffers) > 1 else None
                     pending.appendleft((tracker, ref, buffer))

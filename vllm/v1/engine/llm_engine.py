@@ -35,6 +35,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.tps_profiling import tps_profile_log, tps_profiling_enabled
 from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
@@ -255,6 +256,8 @@ class LLMEngine:
             self.engine_core.add_request(child_request)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
+        profile_enabled = tps_profiling_enabled()
+        step_start_ns = time.perf_counter_ns() if profile_enabled else 0
 
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
@@ -263,6 +266,7 @@ class LLMEngine:
 
         # 1) Get EngineCoreOutput from the EngineCore.
         outputs = self.engine_core.get_output()
+        get_output_end_ns = time.perf_counter_ns() if profile_enabled else 0
 
         # 2) Process EngineCoreOutputs.
         iteration_stats = IterationStats() if self.log_stats else None
@@ -270,6 +274,8 @@ class LLMEngine:
             outputs.outputs,
             engine_core_timestamp=outputs.timestamp,
             iteration_stats=iteration_stats)
+        process_outputs_end_ns = time.perf_counter_ns(
+        ) if profile_enabled else 0
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
@@ -282,6 +288,17 @@ class LLMEngine:
                 iteration_stats=iteration_stats,
             )
             self.do_log_stats_with_interval()
+
+        if profile_enabled:
+            tps_profile_log(
+                "frontend.step",
+                get_output_us=(get_output_end_ns - step_start_ns) / 1000,
+                num_outputs=len(outputs.outputs),
+                process_outputs_us=(process_outputs_end_ns -
+                                    get_output_end_ns) / 1000,
+                reqs_to_abort=len(processed_outputs.reqs_to_abort),
+                total_us=(process_outputs_end_ns - step_start_ns) / 1000,
+            )
 
         return processed_outputs.request_outputs
 
