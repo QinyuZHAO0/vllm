@@ -22,7 +22,7 @@ from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (IterationStats, LoRARequestStates,
                                    RequestStateStats)
-from vllm.v1.tps_profiling import tps_profile_log, tps_profiling_enabled
+from vllm.v1.tps_profiling import tps_profiling_enabled
 
 
 class RequestOutputCollector:
@@ -77,6 +77,11 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[Union[RequestOutput, PoolingRequestOutput]]
     reqs_to_abort: list[str]
+    detokenize_reqs: int = 0
+    detokenize_us: float = 0.0
+    logprobs_us: float = 0.0
+    make_output_us: float = 0.0
+    total_us: float = 0.0
 
 
 class RequestState:
@@ -497,21 +502,19 @@ class OutputProcessor:
                                     iteration_stats)
         self.lora_states.update_iteration_stats(iteration_stats)
 
+        process_total_us = 0.0
         if profile_enabled:
             process_end_ns = time.perf_counter_ns()
-            tps_profile_log(
-                "frontend.process_outputs",
-                detokenize_reqs=detokenize_reqs,
-                detokenize_us=detokenize_ns / 1000,
-                logprobs_us=logprobs_ns / 1000,
-                make_output_us=make_output_ns / 1000,
-                num_outputs=len(engine_core_outputs),
-                total_us=(process_end_ns - process_start_ns) / 1000,
-            )
+            process_total_us = (process_end_ns - process_start_ns) / 1000
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            detokenize_reqs=detokenize_reqs,
+            detokenize_us=detokenize_ns / 1000,
+            logprobs_us=logprobs_ns / 1000,
+            make_output_us=make_output_ns / 1000,
+            total_us=process_total_us,
         )
 
     def do_tracing(self, engine_core_output: EngineCoreOutput,

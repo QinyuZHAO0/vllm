@@ -12,10 +12,27 @@ _TPS_PROFILING_EVERY = max(1, int(os.getenv("VLLM_TPS_PROFILING_EVERY",
                                             "1")))
 _TPS_PROFILING_COUNTERS: dict[str, int] = defaultdict(int)
 _TPS_PROFILING_LOCK = threading.Lock()
+_TPS_LOG_ON_THIS_RANK: bool | None = None
 
 
 def tps_profiling_enabled() -> bool:
     return _TPS_PROFILING_ENABLED
+
+
+def _should_log_on_this_rank() -> bool:
+    global _TPS_LOG_ON_THIS_RANK
+
+    if _TPS_LOG_ON_THIS_RANK is not None:
+        return _TPS_LOG_ON_THIS_RANK
+
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+        _TPS_LOG_ON_THIS_RANK = get_tensor_model_parallel_rank() == 0
+    except Exception:
+        # Frontend or pre-init path: no TP group yet, keep logging enabled.
+        return True
+
+    return _TPS_LOG_ON_THIS_RANK
 
 
 def _format_metric(value: Any) -> str:
@@ -25,7 +42,7 @@ def _format_metric(value: Any) -> str:
 
 
 def tps_profile_log(stage: str, **metrics: Any) -> None:
-    if not _TPS_PROFILING_ENABLED:
+    if not _TPS_PROFILING_ENABLED or not _should_log_on_this_rank():
         return
 
     with _TPS_PROFILING_LOCK:

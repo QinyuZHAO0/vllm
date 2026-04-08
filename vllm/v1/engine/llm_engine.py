@@ -75,6 +75,7 @@ class LLMEngine:
         self.cache_config = vllm_config.cache_config
 
         self.log_stats = log_stats
+        self._pending_preprocess_us = 0.0
 
         executor_backend = (
             self.vllm_config.parallel_config.distributed_executor_backend)
@@ -227,10 +228,13 @@ class LLMEngine:
             raise TypeError(
                 f"request_id must be a string, got {type(request_id)}")
 
+        profile_enabled = tps_profiling_enabled()
+        preprocess_start_ns = time.perf_counter_ns() if profile_enabled else 0
         # Process raw inputs into the request.
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
             tokenization_kwargs, trace_headers, priority)
+        preprocess_end_ns = time.perf_counter_ns() if profile_enabled else 0
 
         n = params.n if isinstance(params, SamplingParams) else 1
 
@@ -239,6 +243,9 @@ class LLMEngine:
             self.output_processor.add_request(request, prompt_str, None, 0)
             # Add the request to EngineCore.
             self.engine_core.add_request(request)
+            if profile_enabled:
+                self._pending_preprocess_us += (
+                    (preprocess_end_ns - preprocess_start_ns) / 1000)
             return
 
         # Fan out child requests (for n>1).
@@ -254,6 +261,9 @@ class LLMEngine:
                                               parent_req, idx)
             # Add the request to EngineCore.
             self.engine_core.add_request(child_request)
+        if profile_enabled:
+            self._pending_preprocess_us += (
+                (preprocess_end_ns - preprocess_start_ns) / 1000)
 
     def step(self) -> Union[list[RequestOutput], list[PoolingRequestOutput]]:
         profile_enabled = tps_profiling_enabled()
@@ -290,12 +300,23 @@ class LLMEngine:
             self.do_log_stats_with_interval()
 
         if profile_enabled:
+            preprocess_us = self._pending_preprocess_us
+            self._pending_preprocess_us = 0.0
+            model_execute_us = (get_output_end_ns - step_start_ns) / 1000
+            postprocess_us = (process_outputs_end_ns - get_output_end_ns) / 1000
             tps_profile_log(
                 "frontend.step",
-                get_output_us=(get_output_end_ns - step_start_ns) / 1000,
+                detokenize_reqs=processed_outputs.detokenize_reqs,
+                detokenize_us=processed_outputs.detokenize_us,
+                get_output_us=model_execute_us,
+                logprobs_us=processed_outputs.logprobs_us,
+                make_output_us=processed_outputs.make_output_us,
+                model_execute_us=model_execute_us,
                 num_outputs=len(outputs.outputs),
-                process_outputs_us=(process_outputs_end_ns -
-                                    get_output_end_ns) / 1000,
+                postprocess_us=postprocess_us,
+                preprocess_us=preprocess_us,
+                process_outputs_total_us=processed_outputs.total_us,
+                process_outputs_us=postprocess_us,
                 reqs_to_abort=len(processed_outputs.reqs_to_abort),
                 total_us=(process_outputs_end_ns - step_start_ns) / 1000,
             )
